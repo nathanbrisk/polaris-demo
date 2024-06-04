@@ -1,0 +1,582 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Polaris Demo
+
+Globals:
+  Function:
+    Timeout: 900
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+
+Parameters:
+  SESSender:
+    Type: String
+    Default: "nathanbrisk@gmail.com"
+    Description: Specify the sender email address.
+  SESRecipient:
+    Type: String
+    Default: "nathanbrisk@gmail.com"
+    Description: Specify the recipient email address.
+  SESIdentityName:
+    Type: String
+    Default: "nathanbrisk@gmail.com"
+    Description: An email address or domain that Amazon SES users use to send email. It is a best practice to authorize only specific email addresses such as in this case sender@example.com to send emails. If your SES Accounts are in sandbox you have to specify both the sender and recipient emails, in that case modify the template.yaml to add the permissions for recipient email address.
+  InputArchiveFolder:
+    Type: String
+    Default: "input_archive"
+    Description: Amazon S3 prefix in the SourceBucket where the input file will be archived after processing.
+  FileChunkSize:
+    Type: String
+    Default: 600
+    Description: Size of each of the chunks, which is split from the input file.
+  FileDelimiter:
+    Type: String
+    Default: ","
+    Description: Delimiter of the CSV file (for example, a comma).
+
+
+Resources:
+  BatchProcessChunk:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: source/state-machine/sfn-process-chunk.json
+      DefinitionSubstitutions:
+        ReadFileFunctionArn: !GetAtt ReadFileFunction.Arn
+        ValidateDataFunctionArn: !GetAtt ValidateDataFunction.Arn
+        PostToSqsFunctionArn: !GetAtt PostToSqsFunction.Arn
+        ApiEndpoint: !Sub "${Api}.execute-api.${AWS::Region}.amazonaws.com"
+        ErrorTableName: !Ref ErrorTable
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ReadFileFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ValidateDataFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PostToSqsFunction
+        - DynamoDBWritePolicy:
+            TableName: !Ref ErrorTable
+
+  BatchMainOrchestrator:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      DefinitionUri: source/state-machine/sfn-main-orchestrator.json
+      DefinitionSubstitutions:
+        SplitInputFileFunctionArn: !GetAtt SplitInputFileFunction.Arn
+        SendEmailFunctionArn: !GetAtt SendEmailFunction.Arn
+        SNSArn: !Ref SNSTopic
+        SESSender: !Ref SESSender
+        SESRecipient: !Ref SESRecipient
+        BatchProcessChunkArn: !GetAtt BatchProcessChunk.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SplitInputFileFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SendEmailFunction
+        - SNSCrudPolicy:
+            TopicName: !GetAtt SNSTopic.TopicName
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt BatchProcessChunk.Name
+        - Statement:
+            - Sid: AllowPutTargets
+              Effect: Allow
+              Action:
+                - events:PutTargets
+                - events:PutRule
+                - events:DescribeRule
+              Resource: !Sub "arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForStepFunctionsExecutionRule"
+            - Sid: AllowStatesDescribeStop
+              Effect: Allow
+              Action:
+                 - states:DescribeExecution
+                 - states:StopExecution
+              Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${BatchProcessChunk.Name}:*"
+
+
+
+  SplitInputFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: source/split-ip-file/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref SourceBucket
+
+
+
+  SplitInputFileFunctionLogGroup:
+    DependsOn: SplitInputFileFunction
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt LogGroupKey.Arn
+      LogGroupName: !Sub /aws/lambda/${SplitInputFileFunction}
+      RetentionInDays: 7
+
+  SendEmailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: source/send-email/
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Policies:
+        - SESCrudPolicy:
+            IdentityName: !Ref SESIdentityName
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+        - DynamoDBReadPolicy:
+            TableName: !Ref ErrorTable
+
+
+
+
+  SendEmailFunctionLogGroup:
+    DependsOn: SendEmailFunction
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt LogGroupKey.Arn
+      LogGroupName: !Sub /aws/lambda/${SendEmailFunction}
+      RetentionInDays: 7
+
+  Api:
+    Type: AWS::Serverless::Api
+    DependsOn: ApiCWLRoleArn
+    Properties:
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: "polaris-demo-usage-plan"
+          Quota:
+            Limit: 100
+            Period: DAY
+          Throttle:
+            BurstLimit: 50
+            RateLimit: 100
+          Description: "Polaris Demo Usage Plan"
+      AccessLogSetting:
+        DestinationArn: !Sub ${ApiAccessLogGroup.Arn}
+        Format: "{ 'requestId':'$context.requestId', 'ip': '$context.identity.sourceIp', 'caller':'$context.identity.caller', 'user':'$context.identity.user','requestTime':'$context.requestTime', 'xrayTraceId':'$context.xrayTraceId', 'wafResponseCode':'$context.wafResponseCode', 'httpMethod':'$context.httpMethod','resourcePath':'$context.resourcePath', 'status':'$context.status','protocol':'$context.protocol', 'responseLength':'$context.responseLength' }"
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn: Api
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${Api}
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt LogGroupKey.Arn
+
+  LogGroupKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-loggroup
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Join
+                - ''
+                - - !Sub 'arn:${AWS::Partition}:iam::'
+                  - !Ref 'AWS::AccountId'
+                  - ':root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Enable Cloudwatch access
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+
+
+  ApiCWLRoleArn:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt CloudWatchRole.Arn
+
+
+  CloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          Action: 'sts:AssumeRole'
+          Effect: Allow
+          Principal:
+            Service: apigateway.amazonaws.com
+      Path: /
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs'
+
+
+  GetFlightPlansFunctionLogGroup:
+    DependsOn: GetFlightPlansFunction
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt LogGroupKey.Arn
+      LogGroupName: !Sub /aws/lambda/${GetFlightPlansFunction}
+      RetentionInDays: 7
+
+  ReadFileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: source/read-file/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref SourceBucket
+
+
+  ReadFileFunctionLogGroup:
+    DependsOn: ReadFileFunction
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt LogGroupKey.Arn
+      LogGroupName: !Sub /aws/lambda/${ReadFileFunction}
+      RetentionInDays: 7
+
+
+
+  ErrorTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: _id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: _id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  FlightPlanTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: _id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: _id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+
+  ValidateDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: source/validate-data/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+
+  ValidateDataFunctionLogGroup:
+    DependsOn: ValidateDataFunction
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt LogGroupKey.Arn
+      LogGroupName: !Sub /aws/lambda/${ValidateDataFunction}
+      RetentionInDays: 7
+
+  PostToSqsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: source/post-to-sqs/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !Ref FlightPlanQueue
+
+
+
+  PostToSqsFunctionLogGroup:
+    DependsOn: PostToSqsFunction
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt LogGroupKey.Arn
+      LogGroupName: !Sub /aws/lambda/${PostToSqsFunction}
+      RetentionInDays: 7
+
+  SourceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+      VersioningConfiguration:
+        Status: Enabled
+
+  LoggingBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+#      AccessControl: LogDeliveryWrite
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: ObjectWriter
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  S3NotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: source/s3-notification/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt BatchMainOrchestrator.Name
+      Environment:
+        Variables:
+          STATE_MACHINE_EXECUTION_NAME: "BatchMainOrchestrator"
+          INPUT_ARCHIVE_FOLDER: !Ref InputArchiveFolder
+          FILE_CHUNK_SIZE: !Ref FileChunkSize
+          FILE_DELIMITER: !Ref FileDelimiter
+          STATE_MACHINE_ARN: !GetAtt BatchMainOrchestrator.Arn
+
+  S3NotificationFunctionLogGroup:
+    DependsOn: S3NotificationFunction
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt LogGroupKey.Arn
+      LogGroupName: !Sub /aws/lambda/${S3NotificationFunction}
+      RetentionInDays: 7
+
+  S3BucketEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      SourceAccount: !Ref 'AWS::AccountId'
+      FunctionName: !Ref S3NotificationFunction
+      SourceArn: !GetAtt SourceBucket.Arn
+      Principal: s3.amazonaws.com
+
+  PostStackProcessingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: S3BucketNotificationDynamoDBInsertPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowBucketNotification
+                Effect: Allow
+                Action: s3:PutBucketNotification
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SourceBucket}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${SourceBucket}/*'
+              - Sid: DynamoDBInsert
+                Effect: Allow
+                Action: dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt FlightPlanTable.Arn
+
+
+  PostStackProcessingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Function to apply notification to the S3 bucket
+      CodeUri: source/custom-resource/
+      Handler: app.lambda_handler
+      Runtime: python3.8
+      Role: !GetAtt PostStackProcessingFunctionRole.Arn
+
+
+  PostStackProcessingFunctionLogGroup:
+    DependsOn: PostStackProcessingFunction
+    Type: AWS::Logs::LogGroup
+    Properties:
+      KmsKeyId: !GetAtt LogGroupKey.Arn
+      LogGroupName: !Sub /aws/lambda/${PostStackProcessingFunction}
+      RetentionInDays: 7
+
+
+
+  PostStackProcessing:
+    Type: Custom::PostStackProcessing
+    Properties:
+      ServiceToken: !GetAtt PostStackProcessingFunction.Arn
+      S3Bucket: !Ref SourceBucket
+      FunctionARN: !GetAtt S3NotificationFunction.Arn
+      NotificationId: S3ObjectCreatedEvent
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      
+      
+  ProcessFlightPlanQueueFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: source/process-flight-plan-queue/
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Events:
+        MySQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FlightPlanQueue.Arn
+            BatchSize: 10
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Minify: false
+        OutExtension:
+          - .js=.mjs
+        Target: "es2022"
+        Sourcemap: true
+        EntryPoints:
+          - index.ts
+        External:
+          - "@aws-sdk/lib-dynamodb"
+          - "@aws-sdk/client-dynamodb"
+  
+  FlightPlanQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: flight-plan-queue
+
+  MyApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: MyLambdaTokenAuthorizer
+        Authorizers:
+          MyLambdaTokenAuthorizer:
+            FunctionArn: !GetAtt MyAuthFunction.Arn
+
+  GetFlightPlansFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FlightPlanTable
+      CodeUri: source/get-flight-plans
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Events:
+        GetRoot:
+          Type: Api
+          Properties:
+            RestApiId: !Ref MyApi
+            Path: /flight-plans
+            Method: get
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FlightPlanTable
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Minify: false
+        OutExtension:
+          - .js=.mjs
+        Target: "es2022"
+        Sourcemap: true
+        EntryPoints:
+          - index.ts
+        External:
+          - "@aws-sdk/lib-dynamodb"
+          - "@aws-sdk/client-dynamodb"
+
+#  PostFlightPlansFunction:
+#    Type: AWS::Serverless::Function
+#    Properties:
+#      CodeUri: source/post-flight-plans
+#      Handler: index.handler
+#      Runtime: nodejs20.x
+#      Events:
+#        PostFlightPlans:
+#          Type: Api
+#          Properties:
+#            RestApiId: !Ref MyApi
+#            Path: /flight-plans
+#            Method: post
+#      Policies:
+#        - DynamoDBReadPolicy:
+#            TableName: !Ref FlightPlanTable
+#        - S3WritePolicy:
+#            BucketName: !Ref SourceBucket
+#    Metadata:
+#      BuildMethod: esbuild
+#      BuildProperties:
+#        Format: esm
+#        Minify: false
+#        OutExtension:
+#          - .js=.mjs
+#        Target: "es2022"
+#        Sourcemap: true
+#        EntryPoints:
+#          - index.ts
+
+  MyAuthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: source/authorizer
+      Handler: authorizer.handler
+      Runtime: nodejs20.x
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Minify: false
+        OutExtension:
+          - .js=.mjs
+        Target: "es2022"
+        Sourcemap: true
+        EntryPoints:
+          - index.ts
+
+
+Outputs:
+
+  SourceBucketARN:
+    Description: "ARN for the Source Bucket"
+    Value: !GetAtt SourceBucket.Arn
+

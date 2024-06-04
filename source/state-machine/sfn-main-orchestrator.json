@@ -1,0 +1,61 @@
+{
+  "Comment": "State machine for batch processing",
+  "StartAt": "Split Input File into chunks",
+  "States": {
+    "Split Input File into chunks": {
+      "Type": "Task",
+      "ResultPath": "$.splitOutput",
+      "Resource": "${SplitInputFileFunctionArn}",
+      "Next": "Call Step function for each chunk"
+    },
+    "Call Step function for each chunk": {
+      "Type": "Map",
+      "Next": "Send email notification",
+      "ItemsPath": "$.splitOutput.splitFileNames",
+      "ResultPath": null,
+      "Parameters": {
+        "FilePath.$": "$$.Map.Item.Value",
+        "FileIndex.$": "$$.Map.Item.Index"
+      },
+      "Iterator": {
+        "StartAt": "Call Chunk Processor Workflow",
+        "States": {
+          "Call Chunk Processor Workflow": {
+           "Type":"Task",
+           "Resource":"arn:aws:states:::states:startExecution.sync:2",
+           "Parameters":{
+              "Input":{
+                "input": {
+                  "FilePath.$": "$.FilePath"
+                }
+               },
+              "StateMachineArn":"${BatchProcessChunkArn}"
+           },
+           "End":true
+        }
+        }
+      }
+    },
+    "Send email notification": {
+      "Type": "Task",
+      "Resource": "${SendEmailFunctionArn}",
+      "Parameters": {
+        "sender": "${SESSender}",
+        "recipient": "${SESRecipient}",
+        "csvInputId.$": "$.splitOutput.csvInputId",
+        "logTableName.$": "${logTableName}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "End": true
+    }
+  }
+}
